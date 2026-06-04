@@ -18,6 +18,7 @@ from pair_trading import (
     PairTradingStrategy,
     StrategyConfig,
     TradingState,
+    BetaCalculator,
 )
 
 
@@ -152,6 +153,19 @@ class TestCointegrationOptimizer(unittest.TestCase):
         self.assertLess(kpss_opt, 0.5)
 
 
+class TestBetaCalculator(unittest.TestCase):
+    """Tests for beta loading calculations."""
+
+    def test_beta_uses_forward_returns(self):
+        """Beta calculation should recover a known return relationship."""
+        market_returns = np.array([0.01, -0.02, 0.03, 0.04])
+        asset_returns = 2.0 * market_returns
+
+        beta = BetaCalculator.calculate_beta(asset_returns, market_returns)
+
+        self.assertAlmostEqual(beta, 2.0, places=10)
+
+
 class TestSignalGenerator(unittest.TestCase):
     """Tests for trading signal generation."""
 
@@ -243,6 +257,28 @@ class TestSignalGenerator(unittest.TestCase):
         # At exactly -5%, should maintain (not < -5%)
         self.assertEqual(signal, 1)
 
+    def test_no_trade_when_fair_value_is_negative(self):
+        """Negative fair values should be treated as non-tradable."""
+        signal = self.generator.generate_signal(
+            price_y=100.0,
+            fair_value=-1.0,
+            kpss_opt=0.3,
+            old_signal=0,
+            current_return=0.0,
+        )
+        self.assertEqual(signal, 0)
+
+    def test_no_trade_when_kpss_is_nan(self):
+        """NaN KPSS should not be treated as cointegrated."""
+        signal = self.generator.generate_signal(
+            price_y=105.0,
+            fair_value=100.0,
+            kpss_opt=np.nan,
+            old_signal=0,
+            current_return=0.0,
+        )
+        self.assertEqual(signal, 0)
+
 
 class TestEntryThreshold(unittest.TestCase):
     """Tests for entry threshold filtering."""
@@ -282,11 +318,10 @@ class TestEntryThreshold(unittest.TestCase):
 
     def test_exactly_at_threshold(self):
         """At exactly 2% divergence, entry is allowed (not strictly < threshold)."""
-        # 2% divergence = 2%, the condition is abs(divergence) < threshold
-        # so exactly at threshold should allow entry
+        # Default divergence is residual / price_y, so this is exactly 2%.
         signal = self.generator.generate_signal(
-            price_y=102.0,
-            fair_value=100.0,
+            price_y=100.0,
+            fair_value=98.0,
             kpss_opt=0.3,
             old_signal=0,
             current_return=0.0,
@@ -376,6 +411,26 @@ class TestReturnCalculation(unittest.TestCase):
 class TestPairTradingStrategy(unittest.TestCase):
     """Integration tests for the full strategy."""
 
+    def test_default_position_sizing_is_gross_normalized(self):
+        """Default standard positions should sum to one gross dollar."""
+        strategy = PairTradingStrategy(StrategyConfig())
+
+        position0, position1 = strategy._calculate_positions(1)
+
+        self.assertEqual(position0, 0.5)
+        self.assertEqual(position1, -0.5)
+
+    def test_legacy_position_sizing_preserves_notebook_exposure(self):
+        """Legacy mode should keep the original +1/-1 legs."""
+        strategy = PairTradingStrategy(
+            StrategyConfig(position_sizing_mode="legacy_notebook")
+        )
+
+        position0, position1 = strategy._calculate_positions(1)
+
+        self.assertEqual(position0, 1.0)
+        self.assertEqual(position1, -1.0)
+
     def test_full_backtest_on_synthetic_data(self):
         """Run full backtest on synthetic cointegrated data."""
         prices0, prices1 = create_cointegrated_prices(n=100, seed=42)
@@ -426,6 +481,39 @@ class TestPairTradingStrategy(unittest.TestCase):
         # Should handle misalignment by finding common dates
         results = strategy.run(prices0, prices1)
         self.assertGreater(len(results), 0)
+
+    def test_stop_loss_cooldown_blocks_same_direction_reentry(self):
+        """A stopped direction should not immediately reopen during cooldown."""
+        dates = pd.date_range(start='2020-01-01', periods=6, freq='D')
+        prices0 = pd.Series([100, 100, 100, 90, 90, 90], index=dates)
+        prices1 = pd.Series([100, 100, 100, 110, 110, 110], index=dates)
+
+        config = StrategyConfig(
+            window=2,
+            entry_threshold=0.01,
+            stop_loss_threshold=-0.05,
+            stop_loss_cooldown_bars=2,
+        )
+        strategy = PairTradingStrategy(config)
+        strategy.optimizer.optimize = lambda prices_y, prices_x: (-10.0, 1.0, 0.1)
+
+        results = strategy.run(prices0, prices1)
+
+        self.assertEqual(results["signal"].iloc[0], 1)
+        self.assertTrue(results["stop_loss_triggered"].iloc[1])
+        self.assertEqual(results["signal"].iloc[2], 0)
+        self.assertTrue(results["entry_blocked_by_cooldown"].iloc[2])
+
+    def test_exact_window_plus_one_raises_clear_error(self):
+        """Need at least one row after the signal bar to calculate returns."""
+        dates = pd.date_range(start='2020-01-01', periods=22, freq='D')
+        prices0 = pd.Series(np.random.randn(22) + 100, index=dates)
+        prices1 = pd.Series(np.random.randn(22) + 100, index=dates)
+
+        strategy = PairTradingStrategy(StrategyConfig(window=21))
+
+        with self.assertRaises(ValueError):
+            strategy.run(prices0, prices1)
 
 
 class TestDataLoader(unittest.TestCase):
@@ -501,6 +589,57 @@ class TestMetricsCalculator(unittest.TestCase):
         metrics = MetricsCalculator.calculate(self.results)
 
         self.assertLessEqual(metrics.max_drawdown, 0)
+
+    def test_ruined_equity_curve_does_not_nan_metrics(self):
+        """Equity crossing zero should produce deterministic invalid metrics."""
+        from backtest import MetricsCalculator
+
+        results = pd.DataFrame({
+            'gross_return': [0.1, -1.2, 0.1],
+            'net_return': [0.1, -1.2, 0.1],
+            'signal': [1, 1, 0],
+        })
+
+        metrics = MetricsCalculator.calculate(results)
+
+        self.assertTrue(metrics.ruin_event)
+        self.assertFalse(metrics.valid_metrics)
+        self.assertEqual(metrics.annualized_return, -1.0)
+        self.assertEqual(metrics.sharpe_ratio, float("-inf"))
+        self.assertFalse(np.isnan(metrics.sortino_ratio))
+
+    def test_sortino_downside_deviation_uses_all_observations(self):
+        """Sortino downside deviation should divide by total N."""
+        from backtest import MetricsCalculator, DAYS_PER_YEAR
+
+        results = pd.DataFrame({
+            'gross_return': [-0.1, 0.0, 0.0, 0.0],
+            'net_return': [-0.1, 0.0, 0.0, 0.0],
+            'signal': [1, 1, 1, 0],
+        })
+
+        metrics = MetricsCalculator.calculate(results)
+        expected_downside = np.sqrt((0.1 ** 2) / 4) * np.sqrt(DAYS_PER_YEAR)
+        expected_sortino = metrics.annualized_return / expected_downside
+
+        self.assertAlmostEqual(metrics.sortino_ratio, expected_sortino)
+
+    def test_signal_accounting_counts_first_entry(self):
+        """Signal accounting should count the first entry and completed exits."""
+        from backtest import MetricsCalculator
+
+        results = pd.DataFrame({
+            'gross_return': [0, 0, 0, 0, 0],
+            'net_return': [0, 0, 0, 0, 0],
+            'signal': [1, 1, 0, -1, 0],
+        })
+
+        metrics = MetricsCalculator.calculate(results)
+
+        self.assertEqual(metrics.signal_changes, 4)
+        self.assertEqual(metrics.entries, 2)
+        self.assertEqual(metrics.exits, 2)
+        self.assertEqual(metrics.round_trips, 2)
 
 
 if __name__ == '__main__':

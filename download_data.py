@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import json
 import os
 import time
@@ -8,6 +9,54 @@ import pandas as pd
 import requests
 
 from utils import load_config
+
+
+def load_download_cache(cache_path: str) -> dict:
+    """Load the download timestamp cache."""
+    if os.path.exists(cache_path):
+        with open(cache_path, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_download_cache(cache_path: str, cache: dict) -> None:
+    """Save the download timestamp cache."""
+    cache_dir = os.path.dirname(cache_path)
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+    with open(cache_path, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def is_within_grace_period(cache_key: str, cache: dict, grace_hours: float) -> bool:
+    """Check if symbol was downloaded within the grace period."""
+    if grace_hours <= 0 or cache_key not in cache:
+        return False
+    last_download = cache[cache_key].get("last_download", 0)
+    elapsed_hours = (time.time() - last_download) / 3600
+    return elapsed_hours < grace_hours
+
+
+def get_download_cache_path(config: dict, feather_dir: str) -> str:
+    """Get the download cache path from config or derive a stable default."""
+    if config.get("download_cache_file"):
+        return config["download_cache_file"]
+
+    parent_dir = os.path.dirname(feather_dir)
+    if not parent_dir:
+        parent_dir = "."
+    return os.path.join(parent_dir, "download_cache.json")
+
+
+def feather_file_is_usable(path: str) -> bool:
+    """Return True when a feather file exists and contains at least one row."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return False
+    try:
+        return not pd.read_feather(path).empty
+    except Exception:
+        return False
+
 
 COLUMNS = [
     "open_time",
@@ -94,9 +143,15 @@ def update_symbol_data(
     base_url: str,
     limit: int,
     start_date: Optional[str] = None,
+    exclude_incomplete_candles: bool = True,
 ) -> pd.DataFrame:
     interval_ms = interval_to_millis(interval)
-    end_time = int(time.time() * 1000)
+    now_ms = int(time.time() * 1000)
+    if exclude_incomplete_candles:
+        current_open = (now_ms // interval_ms) * interval_ms
+        end_time = current_open - 1
+    else:
+        end_time = now_ms
 
     existing: Optional[pd.DataFrame] = None
     if os.path.exists(out_path):
@@ -167,6 +222,7 @@ def download_symbols(
     config: dict,
     symbols: list[str],
     full_symbol_names: bool = False,
+    force: bool = False,
 ) -> list[str]:
     """
     Download data for a list of symbols using config settings.
@@ -176,6 +232,7 @@ def download_symbols(
         symbols: List of symbol names (e.g., ["BTC", "ETH"] or ["BTCUSDT", "ETHUSDT"])
         full_symbol_names: If True, symbols are full names (e.g., BTCUSDT).
                           If False, quote currency is appended.
+        force: If True, bypass grace period and force download.
 
     Returns:
         List of symbols that were successfully downloaded
@@ -186,23 +243,64 @@ def download_symbols(
     limit = int(config.get("max_klines_per_request", 1500))
     start_date = config.get("start_date")
     feather_dir = config.get("feather_dir") or config.get("data_dir", "data/feather")
+    grace_hours = float(config.get("download_grace_hours", 0))
+    exclude_incomplete_candles = config.get("exclude_incomplete_candles", True)
 
     os.makedirs(feather_dir, exist_ok=True)
+
+    # Load download cache
+    cache_path = get_download_cache_path(config, feather_dir)
+    cache = load_download_cache(cache_path)
 
     successful = []
     for symbol in sorted(set(symbols)):
         full_symbol = symbol if full_symbol_names else f"{symbol}{quote}"
-        out_path = os.path.join(feather_dir, f"{full_symbol}_{interval}.feather")
+        cache_key = f"{full_symbol}_{interval}"
+        out_path = os.path.join(feather_dir, f"{cache_key}.feather")
+
+        # Check grace period unless force is True
+        if not force and is_within_grace_period(cache_key, cache, grace_hours):
+            if feather_file_is_usable(out_path):
+                print(f"Skipping {full_symbol} - downloaded within grace period")
+                successful.append(symbol)
+                continue
+            print(f"{full_symbol}: cache entry is fresh but data file is missing or empty; downloading.")
+
         try:
-            update_symbol_data(full_symbol, interval, out_path, base_url, limit, start_date)
+            updated = update_symbol_data(
+                full_symbol,
+                interval,
+                out_path,
+                base_url,
+                limit,
+                start_date,
+                exclude_incomplete_candles=exclude_incomplete_candles,
+            )
+            if updated is None or updated.empty or not feather_file_is_usable(out_path):
+                print(f"  Warning: No usable data saved for {full_symbol}")
+                continue
+
             successful.append(symbol)
+
+            # Update cache with current timestamp
+            cache[cache_key] = {
+                "last_download": time.time(),
+                "last_download_dt": datetime.datetime.now().isoformat(timespec="seconds"),
+            }
         except Exception as e:
             print(f"  Warning: Failed to download {full_symbol}: {e}")
+
+    # Save updated cache
+    save_download_cache(cache_path, cache)
 
     return successful
 
 
-def main(config_path: str = "config.json", symbols_override: Optional[list] = None) -> None:
+def main(
+    config_path: str = "config.json",
+    symbols_override: Optional[list] = None,
+    force: bool = False,
+) -> None:
     config = load_config(config_path)
 
     if symbols_override:
@@ -218,7 +316,7 @@ def main(config_path: str = "config.json", symbols_override: Optional[list] = No
     if not symbols:
         raise ValueError("No symbols provided. Add 'symbols' list to config or use --symbols flag.")
 
-    download_symbols(config, symbols, full_symbol_names=full_symbol_names)
+    download_symbols(config, symbols, full_symbol_names=full_symbol_names, force=force)
     print("Download complete.")
 
 
@@ -232,6 +330,11 @@ if __name__ == "__main__":
         nargs="*",
         help="Optional list of symbols to download (e.g., BTCUSDT ETHUSDT).",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force download, bypassing the grace period check.",
+    )
     args = parser.parse_args()
 
-    main(args.config, args.symbols)
+    main(args.config, args.symbols, force=args.force)

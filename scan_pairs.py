@@ -8,15 +8,167 @@ existing pair trading strategy and backtest infrastructure.
 import argparse
 import itertools
 import os
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Optional
 
+import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 from backtest import DataLoader, MetricsCalculator, PerformanceMetrics, Visualizer
 from download_data import download_symbols
 from pair_trading import PairTradingStrategy, StrategyConfig
 from utils import load_config
+
+
+def _strategy_config_to_dict(config: StrategyConfig) -> dict:
+    """Convert StrategyConfig to a picklable dict for multiprocessing."""
+    return {
+        "window": config.window,
+        "kpss_threshold": config.kpss_threshold,
+        "entry_threshold": config.entry_threshold,
+        "stop_loss_threshold": config.stop_loss_threshold,
+        "transaction_fee": config.transaction_fee,
+        "unbiased_formulation": config.unbiased_formulation,
+        "beta_loading": config.beta_loading,
+        "beta_proxy_symbol": config.beta_proxy_symbol,
+        "position_sizing_mode": config.position_sizing_mode,
+        "stop_loss_cooldown_bars": config.stop_loss_cooldown_bars,
+        "exit_on_decointegration": config.exit_on_decointegration,
+        "min_fair_value": config.min_fair_value,
+        "divergence_mode": config.divergence_mode,
+    }
+
+
+def _load_market_prices(
+    data_loader: DataLoader,
+    strategy_config: StrategyConfig,
+) -> Optional[pd.Series]:
+    """Load beta proxy prices when beta loading is enabled."""
+    if strategy_config.beta_loading and strategy_config.beta_proxy_symbol:
+        return data_loader.load_prices(strategy_config.beta_proxy_symbol)
+    return None
+
+
+def _metrics_to_scan_result(
+    sym0: str,
+    sym1: str,
+    metrics: PerformanceMetrics,
+    data_points: int,
+) -> dict:
+    """Convert metrics into the scanner row format."""
+    return {
+        "pair": f"{sym0}/{sym1}",
+        "symbol0": sym0,
+        "symbol1": sym1,
+        "total_return": metrics.total_return,
+        "annualized_return": metrics.annualized_return,
+        "annualized_volatility": metrics.annualized_volatility,
+        "sharpe_ratio": metrics.sharpe_ratio,
+        "sortino_ratio": metrics.sortino_ratio,
+        "max_drawdown": metrics.max_drawdown,
+        "win_rate": metrics.win_rate,
+        "daily_win_rate": metrics.daily_win_rate,
+        "profit_factor": metrics.profit_factor,
+        "total_trades": metrics.total_trades,
+        "signal_changes": metrics.signal_changes,
+        "entries": metrics.entries,
+        "exits": metrics.exits,
+        "round_trips": metrics.round_trips,
+        "calmar_ratio": metrics.calmar_ratio,
+        "valid_metrics": metrics.valid_metrics,
+        "ruin_event": metrics.ruin_event,
+        "data_points": data_points,
+    }
+
+
+def _error_result(sym0: str, sym1: str, error: Exception, debug_errors: bool = False) -> dict:
+    """Return a structured scanner failure."""
+    result = {
+        "pair": f"{sym0}/{sym1}",
+        "symbol0": sym0,
+        "symbol1": sym1,
+        "error": f"{type(error).__name__}: {error}",
+    }
+    if debug_errors:
+        result["traceback"] = traceback.format_exc()
+    return result
+
+
+def _sort_results(df: pd.DataFrame, sort_by: str, top_n: Optional[int] = None) -> pd.DataFrame:
+    """Sort valid metric rows ahead of invalid rows for stable rankings."""
+    if df.empty:
+        return df
+
+    ascending = False
+    sorted_df = df.copy()
+    valid = sorted_df.get("valid_metrics", pd.Series(True, index=sorted_df.index)).fillna(False)
+    values = pd.to_numeric(sorted_df[sort_by], errors="coerce")
+    sorted_df["_valid_sort"] = valid & values.notna()
+
+    sorted_df = sorted_df.sort_values(
+        ["_valid_sort", sort_by],
+        ascending=[False, ascending],
+        na_position="last",
+    ).drop(columns=["_valid_sort"])
+
+    return sorted_df.head(top_n) if top_n is not None else sorted_df
+
+
+def _format_metric(value: float, suffix: str = "", signed: bool = False) -> str:
+    """Format finite and non-finite metric values for tables."""
+    if pd.isna(value):
+        return "n/a"
+    if value == float("inf"):
+        return "inf"
+    if value == float("-inf"):
+        return "-inf"
+    sign = "+" if signed else ""
+    return f"{value:{sign}.2f}{suffix}"
+
+
+def _scan_single_pair_worker(args: tuple) -> Optional[dict]:
+    """
+    Worker function to scan a single pair in a subprocess.
+
+    Args:
+        args: Tuple of (sym0, sym1, config_dict, strategy_config_dict, debug_errors)
+
+    Returns:
+        Dictionary with pair metrics or None on failure
+    """
+    sym0, sym1, config_dict, strategy_config_dict, debug_errors = args
+
+    # Set matplotlib backend to avoid GUI issues in subprocess
+    matplotlib.use("Agg")
+
+    try:
+        # Create own instances (not shared across processes)
+        data_loader = DataLoader(config_dict)
+        strategy_config = StrategyConfig(**strategy_config_dict)
+
+        # Load data
+        prices0, prices1 = data_loader.load_pair(sym0, sym1)
+        market_prices = _load_market_prices(data_loader, strategy_config)
+
+        # Check minimum data requirement
+        min_required = strategy_config.window + 10
+        if len(prices0) < min_required:
+            return None
+
+        # Run strategy
+        strategy = PairTradingStrategy(strategy_config)
+        results = strategy.run(prices0, prices1, market_prices)
+
+        # Calculate metrics
+        metrics = MetricsCalculator.calculate(results)
+
+        return _metrics_to_scan_result(sym0, sym1, metrics, len(results))
+
+    except Exception as e:
+        return _error_result(sym0, sym1, e, debug_errors)
 
 
 # Default top 20 cryptocurrencies by market cap (available on Binance Futures)
@@ -44,6 +196,9 @@ class PairScanner:
         self.strategy_config = StrategyConfig.from_dict(self.config)
         self.data_loader = DataLoader(self.config)
         self.results: list[dict] = []
+        self.scan_config = self.config.get("scan", {})
+        self.debug_errors = self.scan_config.get("debug_errors", False)
+        self.fail_fast = self.scan_config.get("fail_fast", False)
 
     def download_all_data(self, symbols: list[str]) -> list[str]:
         """
@@ -60,17 +215,28 @@ class PairScanner:
         print(f"Download complete: {len(successful)}/{len(symbols)} symbols")
         return successful
 
-    def generate_pairs(self, symbols: list[str]) -> list[tuple[str, str]]:
+    def generate_pairs(
+        self,
+        symbols: list[str],
+        bidirectional: Optional[bool] = None,
+    ) -> list[tuple[str, str]]:
         """
         Generate all unique pairs from the symbol list.
 
         Args:
             symbols: List of symbol names
+            bidirectional: If True, include both A/B and B/A
 
         Returns:
             List of (symbol0, symbol1) tuples
         """
-        return list(itertools.combinations(symbols, 2))
+        if bidirectional is None:
+            bidirectional = self.scan_config.get("scan_bidirectional", False)
+
+        pairs = list(itertools.combinations(symbols, 2))
+        if bidirectional:
+            pairs.extend((sym1, sym0) for sym0, sym1 in list(pairs))
+        return pairs
 
     def run_single_pair(self, sym0: str, sym1: str) -> Optional[dict]:
         """
@@ -86,6 +252,7 @@ class PairScanner:
         try:
             # Load data
             prices0, prices1 = self.data_loader.load_pair(sym0, sym1)
+            market_prices = _load_market_prices(self.data_loader, self.strategy_config)
 
             # Check minimum data requirement
             min_required = self.strategy_config.window + 10
@@ -95,43 +262,127 @@ class PairScanner:
 
             # Run strategy
             strategy = PairTradingStrategy(self.strategy_config)
-            results = strategy.run(prices0, prices1)
+            results = strategy.run(prices0, prices1, market_prices)
 
             # Calculate metrics
             metrics = MetricsCalculator.calculate(results)
 
-            return {
-                "pair": f"{sym0}/{sym1}",
-                "symbol0": sym0,
-                "symbol1": sym1,
-                "total_return": metrics.total_return,
-                "annualized_return": metrics.annualized_return,
-                "annualized_volatility": metrics.annualized_volatility,
-                "sharpe_ratio": metrics.sharpe_ratio,
-                "sortino_ratio": metrics.sortino_ratio,
-                "max_drawdown": metrics.max_drawdown,
-                "win_rate": metrics.win_rate,
-                "profit_factor": metrics.profit_factor,
-                "total_trades": metrics.total_trades,
-                "calmar_ratio": metrics.calmar_ratio,
-                "data_points": len(results),
-            }
+            return _metrics_to_scan_result(sym0, sym1, metrics, len(results))
 
         except FileNotFoundError as e:
             print(f"  Warning: Data not found for {sym0}/{sym1}: {e}")
+            if getattr(self, "fail_fast", False):
+                raise
             return None
         except ValueError as e:
             print(f"  Warning: Error processing {sym0}/{sym1}: {e}")
+            if getattr(self, "fail_fast", False):
+                raise
             return None
         except Exception as e:
             print(f"  Warning: Unexpected error for {sym0}/{sym1}: {e}")
+            if getattr(self, "debug_errors", False):
+                print(traceback.format_exc())
+            if getattr(self, "fail_fast", False):
+                raise
             return None
+
+    def _scan_sequential(self, pairs: list[tuple[str, str]]) -> tuple[list[dict], int, int]:
+        """
+        Run backtest on pairs sequentially.
+
+        Args:
+            pairs: List of (symbol0, symbol1) tuples
+
+        Returns:
+            Tuple of (results list, successful count, failed count)
+        """
+        results = []
+        successful = 0
+        failed = 0
+
+        for i, (sym0, sym1) in enumerate(pairs):
+            print(f"[{i+1}/{len(pairs)}] Testing {sym0}/{sym1}...", end=" ")
+            result = self.run_single_pair(sym0, sym1)
+
+            if result is not None:
+                results.append(result)
+                print(f"Sharpe: {result['sharpe_ratio']:.2f}, Return: {result['total_return']*100:.1f}%")
+                successful += 1
+            else:
+                failed += 1
+
+        return results, successful, failed
+
+    def _scan_parallel(self, pairs: list[tuple[str, str]], workers: int) -> tuple[list[dict], int, int]:
+        """
+        Run backtest on pairs in parallel using multiprocessing.
+
+        Args:
+            pairs: List of (symbol0, symbol1) tuples
+            workers: Number of parallel workers
+
+        Returns:
+            Tuple of (results list, successful count, failed count)
+        """
+        results = []
+        successful = 0
+        failed = 0
+
+        # Prepare picklable arguments
+        strategy_config_dict = _strategy_config_to_dict(self.strategy_config)
+        work_items = [
+            (sym0, sym1, self.config, strategy_config_dict, self.debug_errors)
+            for sym0, sym1 in pairs
+        ]
+
+        print(f"Running parallel scan with {workers} workers...")
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            # Submit all work items
+            future_to_pair = {
+                executor.submit(_scan_single_pair_worker, item): (item[0], item[1])
+                for item in work_items
+            }
+
+            # Collect results as they complete
+            completed = 0
+            for future in as_completed(future_to_pair):
+                completed += 1
+                sym0, sym1 = future_to_pair[future]
+
+                try:
+                    result = future.result()
+                    if result is not None and "error" not in result:
+                        results.append(result)
+                        successful += 1
+                    else:
+                        if result is not None and "error" in result:
+                            print(f"  Warning: {result['pair']} failed: {result['error']}")
+                            if self.debug_errors and result.get("traceback"):
+                                print(result["traceback"])
+                            if self.fail_fast:
+                                raise RuntimeError(result["error"])
+                        failed += 1
+                except Exception as e:
+                    if self.fail_fast:
+                        raise
+                    print(f"  Warning: Unexpected worker failure for {sym0}/{sym1}: {e}")
+                    failed += 1
+
+                # Report progress every 10 pairs
+                if completed % 10 == 0 or completed == len(pairs):
+                    print(f"Progress: {completed}/{len(pairs)} pairs processed...")
+
+        return results, successful, failed
 
     def scan(
         self,
         symbols: Optional[list[str]] = None,
         download: bool = True,
         auto_fetch: bool = True,
+        min_trades: int = 60,
+        workers: int = 4,
     ) -> pd.DataFrame:
         """
         Run full scan on all pairs.
@@ -140,6 +391,8 @@ class PairScanner:
             symbols: List of symbols to scan (defaults to config scan_symbols or TOP_20)
             download: If True, download data before scanning
             auto_fetch: If True and no symbols specified, fetch from Binance API
+            min_trades: Minimum number of signal changes required (default: 60)
+            workers: Number of parallel workers (1 for sequential)
 
         Returns:
             DataFrame with results sorted by Sharpe ratio
@@ -170,23 +423,13 @@ class PairScanner:
             print(f"Using {len(symbols)} symbols with available data")
 
         pairs = self.generate_pairs(symbols)
-        print(f"Generated {len(pairs)} unique pairs")
+        print(f"Generated {len(pairs)} pair tests")
 
-        # Run backtest on each pair
-        self.results = []
-        successful = 0
-        failed = 0
-
-        for i, (sym0, sym1) in enumerate(pairs):
-            print(f"[{i+1}/{len(pairs)}] Testing {sym0}/{sym1}...", end=" ")
-            result = self.run_single_pair(sym0, sym1)
-
-            if result is not None:
-                self.results.append(result)
-                print(f"Sharpe: {result['sharpe_ratio']:.2f}, Return: {result['total_return']*100:.1f}%")
-                successful += 1
-            else:
-                failed += 1
+        # Run backtest on each pair (parallel or sequential)
+        if workers > 1:
+            self.results, successful, failed = self._scan_parallel(pairs, workers)
+        else:
+            self.results, successful, failed = self._scan_sequential(pairs)
 
         print(f"\nCompleted: {successful} successful, {failed} failed")
 
@@ -195,7 +438,16 @@ class PairScanner:
             return pd.DataFrame()
 
         df = pd.DataFrame(self.results)
-        return df
+
+        # Filter by minimum trades
+        if min_trades > 0:
+            before_count = len(df)
+            df = df[df["total_trades"] >= min_trades]
+            filtered_count = before_count - len(df)
+            if filtered_count > 0:
+                print(f"Filtered out {filtered_count} pairs with fewer than {min_trades} trades")
+
+        return _sort_results(df, "sharpe_ratio")
 
     def save_results(self, df: pd.DataFrame, output_path: Optional[str] = None) -> tuple[str, str]:
         """
@@ -241,8 +493,7 @@ def format_results_table(df: pd.DataFrame, sort_by: str, top_n: int = 10) -> str
         return "No results to display."
 
     # Sort and take top N
-    ascending = sort_by == "max_drawdown"  # Lower is better for max_drawdown
-    sorted_df = df.sort_values(sort_by, ascending=ascending).head(top_n)
+    sorted_df = _sort_results(df, sort_by, top_n)
 
     lines = []
     header = f"{'Rank':<6}{'Pair':<14}{'Total Ret':>12}{'Ann. Ret':>12}{'Sharpe':>10}{'Sortino':>10}{'Max DD':>12}{'Trades':>8}"
@@ -250,11 +501,11 @@ def format_results_table(df: pd.DataFrame, sort_by: str, top_n: int = 10) -> str
     lines.append("-" * len(header))
 
     for i, (_, row) in enumerate(sorted_df.iterrows(), 1):
-        total_ret = f"{row['total_return']*100:+.2f}%"
-        ann_ret = f"{row['annualized_return']*100:+.2f}%"
-        sharpe = f"{row['sharpe_ratio']:.2f}"
-        sortino = f"{row['sortino_ratio']:.2f}"
-        max_dd = f"{row['max_drawdown']*100:.2f}%"
+        total_ret = _format_metric(row['total_return'] * 100, "%", signed=True)
+        ann_ret = _format_metric(row['annualized_return'] * 100, "%", signed=True)
+        sharpe = _format_metric(row['sharpe_ratio'])
+        sortino = _format_metric(row['sortino_ratio'])
+        max_dd = _format_metric(row['max_drawdown'] * 100, "%")
         trades = f"{row['total_trades']}"
 
         line = f"{i:<6}{row['pair']:<14}{total_ret:>12}{ann_ret:>12}{sharpe:>10}{sortino:>10}{max_dd:>12}{trades:>8}"
@@ -273,8 +524,8 @@ def _get_unique_best_pairs(df: pd.DataFrame) -> list[tuple[pd.Series, str]]:
     Returns:
         List of (row, label) tuples for unique best pairs
     """
-    best_sharpe = df.loc[df["sharpe_ratio"].idxmax()]
-    best_return = df.loc[df["total_return"].idxmax()]
+    best_sharpe = _sort_results(df, "sharpe_ratio", 1).iloc[0]
+    best_return = _sort_results(df, "total_return", 1).iloc[0]
 
     pairs = [(best_sharpe, "best_sharpe")]
     if best_return["pair"] != best_sharpe["pair"]:
@@ -296,8 +547,9 @@ def _run_pair_backtest(scanner: PairScanner, sym0: str, sym1: str) -> tuple[pd.D
         Tuple of (results DataFrame, metrics)
     """
     prices0, prices1 = scanner.data_loader.load_pair(sym0, sym1)
+    market_prices = _load_market_prices(scanner.data_loader, scanner.strategy_config)
     strategy = PairTradingStrategy(scanner.strategy_config)
-    results = strategy.run(prices0, prices1)
+    results = strategy.run(prices0, prices1, market_prices)
     metrics = MetricsCalculator.calculate(results)
     return results, metrics
 
@@ -420,7 +672,10 @@ def print_scan_results(df: pd.DataFrame, top_n: int = 10) -> None:
         return
 
     total_pairs = len(df)
-    successful = len(df[df["sharpe_ratio"].notna()])
+    if "valid_metrics" in df.columns:
+        successful = int(df["valid_metrics"].fillna(False).sum())
+    else:
+        successful = len(df[df["sharpe_ratio"].notna()])
 
     print()
     print("=" * 80)
@@ -475,17 +730,51 @@ def main():
         "--no-auto-fetch", action="store_true",
         help="Disable auto-fetching symbols from Binance (use hardcoded list)"
     )
+    parser.add_argument(
+        "--min-trades", type=int, default=None,
+        help="Minimum number of trades required (default: from config or 60)"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=4,
+        help="Number of parallel workers (default: 4, use 1 for sequential)"
+    )
+    parser.add_argument(
+        "--bidirectional", action="store_true",
+        help="Scan both A/B and B/A directions"
+    )
+    parser.add_argument(
+        "--debug-errors", action="store_true",
+        help="Print tracebacks for failed pair scans"
+    )
+    parser.add_argument(
+        "--fail-fast", action="store_true",
+        help="Stop scanning on the first pair-processing error"
+    )
 
     args = parser.parse_args()
 
     # Initialize scanner
     scanner = PairScanner(args.config)
+    if args.bidirectional:
+        scanner.scan_config["scan_bidirectional"] = True
+    if args.debug_errors:
+        scanner.debug_errors = True
+    if args.fail_fast:
+        scanner.fail_fast = True
+
+    # Get min_trades from CLI or config
+    min_trades = args.min_trades
+    if min_trades is None:
+        scan_config = scanner.config.get("scan", {})
+        min_trades = scan_config.get("min_trades", 60)
 
     # Run scan
     results_df = scanner.scan(
         symbols=args.symbols,
         download=not args.no_download,
         auto_fetch=not args.no_auto_fetch,
+        min_trades=min_trades,
+        workers=args.workers,
     )
 
     if results_df.empty:

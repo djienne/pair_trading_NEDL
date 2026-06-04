@@ -4,6 +4,9 @@
     "auto_fetch_symbols": true,
     "top_n_symbols": 50,
     "symbol_cache_hours": 24,
+    "download_grace_hours": 12,
+    "download_cache_file": "data/download_cache.json",
+    "exclude_incomplete_candles": true,
     "interval": "1d",
     "start_date": "2019-01-01",
     "end_date": null,
@@ -13,17 +16,30 @@
     "output_dir": "output",
 
     "strategy": {
-        "window": 21,
+        "window": 100,
         "kpss_threshold": 0.463,
         "entry_threshold": 0.02,
         "stop_loss_threshold": -0.05,
         "transaction_fee": 0.0001,
         "unbiased_formulation": true,
         "beta_loading": false,
-        "beta_proxy_symbol": "BTC"
+        "beta_proxy_symbol": "BTC",
+        "position_sizing_mode": "gross_normalized",
+        "legacy_notebook_sizing": false,
+        "stop_loss_cooldown_bars": 5,
+        "exit_on_decointegration": false,
+        "min_fair_value": 1e-12,
+        "divergence_mode": "residual_over_price"
     },
 
     "backtest": {
         "initial_capital": 1000
+    },
+
+    "scan": {
+        "min_trades": 60,
+        "scan_bidirectional": false,
+        "debug_errors": false,
+        "fail_fast": false
     }
 }

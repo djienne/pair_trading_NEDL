@@ -124,6 +124,13 @@ class PerformanceMetrics:
     profit_factor: float
     total_trades: int
     calmar_ratio: float
+    daily_win_rate: float = 0.0
+    signal_changes: int = 0
+    entries: int = 0
+    exits: int = 0
+    round_trips: int = 0
+    valid_metrics: bool = True
+    ruin_event: bool = False
 
     def to_dict(self) -> dict:
         """Convert metrics to dictionary."""
@@ -134,10 +141,15 @@ class PerformanceMetrics:
             "Sharpe Ratio": self.sharpe_ratio,
             "Sortino Ratio": self.sortino_ratio,
             "Max Drawdown (%)": self.max_drawdown * 100,
-            "Win Rate (%)": self.win_rate * 100,
+            "Daily Win Rate (%)": self.daily_win_rate * 100,
             "Profit Factor": self.profit_factor,
-            "Total Trades": self.total_trades,
+            "Signal Changes": self.signal_changes,
+            "Entries": self.entries,
+            "Exits": self.exits,
+            "Round Trips": self.round_trips,
             "Calmar Ratio": self.calmar_ratio,
+            "Valid Metrics": self.valid_metrics,
+            "Ruin Event": self.ruin_event,
         }
 
     def __str__(self) -> str:
@@ -149,6 +161,32 @@ class PerformanceMetrics:
             else:
                 lines.append(f"{name}: {value:.4f}")
         return "\n".join(lines)
+
+
+def _periods_per_year(index: pd.Index, n_periods: int) -> float:
+    """Estimate annualization frequency from calendar span when possible."""
+    if n_periods <= 0:
+        return float(DAYS_PER_YEAR)
+
+    if isinstance(index, pd.DatetimeIndex) and len(index) > 1:
+        elapsed_seconds = (index[-1] - index[0]).total_seconds()
+        if elapsed_seconds > 0:
+            years = elapsed_seconds / (DAYS_PER_YEAR * 24 * 60 * 60)
+            if years > 0:
+                return n_periods / years
+
+    return float(DAYS_PER_YEAR)
+
+
+def _safe_ratio(numerator: float, denominator: float) -> float:
+    """Return a stable ratio for metric calculations."""
+    if denominator > 0:
+        return numerator / denominator
+    if numerator > 0:
+        return float("inf")
+    if numerator < 0:
+        return float("-inf")
+    return 0.0
 
 
 class MetricsCalculator:
@@ -166,51 +204,85 @@ class MetricsCalculator:
         Returns:
             PerformanceMetrics instance
         """
-        returns_col = 'net_return' if use_net else 'gross_return'
-        returns = results[returns_col].fillna(0)
+        if results.empty:
+            raise ValueError("Cannot calculate metrics for empty results")
 
-        # Total return
+        returns_col = 'net_return' if use_net else 'gross_return'
+        raw_returns = pd.to_numeric(results[returns_col], errors="coerce")
+        has_infinite_return = np.isinf(raw_returns).any()
+        returns = raw_returns.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+        # Total return and ruin detection
         cumulative = (1 + returns).cumprod()
-        total_return = cumulative.iloc[-1] - 1
+        ruin_event = bool(
+            has_infinite_return
+            or (cumulative <= 0).any()
+            or not np.isfinite(cumulative).all()
+        )
+        terminal_equity = cumulative.iloc[-1]
+        total_return = terminal_equity - 1 if np.isfinite(terminal_equity) else -1.0
+
+        n_periods = len(returns)
+        periods_per_year = _periods_per_year(results.index, n_periods)
 
         # Annualized return
-        n_periods = len(returns)
-        annualized_return = (1 + total_return) ** (DAYS_PER_YEAR / n_periods) - 1
+        if ruin_event:
+            annualized_return = -1.0
+        else:
+            years = n_periods / periods_per_year if periods_per_year > 0 else n_periods / DAYS_PER_YEAR
+            annualized_return = terminal_equity ** (1 / years) - 1 if years > 0 else 0.0
 
         # Annualized volatility
-        daily_vol = returns.std()
-        annualized_volatility = daily_vol * np.sqrt(DAYS_PER_YEAR)
+        period_vol = returns.std()
+        annualized_volatility = period_vol * np.sqrt(periods_per_year)
 
         # Sharpe ratio (assuming 0 risk-free rate for crypto)
-        sharpe_ratio = (annualized_return / annualized_volatility
-                       if annualized_volatility > 0 else 0)
+        sharpe_ratio = _safe_ratio(annualized_return, annualized_volatility)
 
-        # Sortino ratio (downside deviation)
-        negative_returns = returns[returns < 0]
-        downside_dev = np.sqrt((negative_returns ** 2).mean()) * np.sqrt(DAYS_PER_YEAR)
-        sortino_ratio = annualized_return / downside_dev if downside_dev > 0 else 0
+        # Sortino ratio (standard downside deviation divides by all observations)
+        downside_returns = returns.clip(upper=0)
+        downside_dev = np.sqrt((downside_returns ** 2).mean()) * np.sqrt(periods_per_year)
+        sortino_ratio = _safe_ratio(annualized_return, downside_dev)
 
         # Max drawdown
         peak = cumulative.expanding().max()
         drawdown = (cumulative - peak) / peak
         max_drawdown = drawdown.min()
 
-        # Win rate
+        # Daily win rate
         non_zero_returns = returns[returns != 0]
-        win_rate = (non_zero_returns > 0).mean() if len(non_zero_returns) > 0 else 0
+        daily_win_rate = (non_zero_returns > 0).mean() if len(non_zero_returns) > 0 else 0
 
         # Profit factor
         gross_profits = returns[returns > 0].sum()
         gross_losses = abs(returns[returns < 0].sum())
-        profit_factor = gross_profits / gross_losses if gross_losses > 0 else float('inf')
+        profit_factor = _safe_ratio(gross_profits, gross_losses)
 
-        # Total trades (count signal changes)
-        signal_changes = results['signal'].diff().fillna(0) != 0
-        total_trades = signal_changes.sum()
+        # Signal accounting
+        signals = results['signal'].fillna(0)
+        previous_signals = signals.shift(fill_value=0)
+        signal_change_mask = signals != previous_signals
+        signal_changes = int(signal_change_mask.sum())
+        entries = int(((signals != 0) & signal_change_mask).sum())
+        exits = int(((previous_signals != 0) & signal_change_mask).sum())
+        round_trips = min(entries, exits)
 
         # Calmar ratio
-        calmar_ratio = (annualized_return / abs(max_drawdown)
-                       if max_drawdown != 0 else float('inf'))
+        calmar_ratio = _safe_ratio(annualized_return, abs(max_drawdown))
+
+        valid_metrics = bool(
+            not ruin_event
+            and np.isfinite(annualized_return)
+            and np.isfinite(annualized_volatility)
+            and not np.isnan(sharpe_ratio)
+            and not np.isnan(sortino_ratio)
+            and not np.isnan(calmar_ratio)
+        )
+        if ruin_event:
+            sharpe_ratio = float("-inf")
+            sortino_ratio = float("-inf")
+            calmar_ratio = float("-inf")
+            valid_metrics = False
 
         return PerformanceMetrics(
             total_return=total_return,
@@ -219,10 +291,17 @@ class MetricsCalculator:
             sharpe_ratio=sharpe_ratio,
             sortino_ratio=sortino_ratio,
             max_drawdown=max_drawdown,
-            win_rate=win_rate,
+            win_rate=daily_win_rate,
             profit_factor=profit_factor,
-            total_trades=int(total_trades),
+            total_trades=signal_changes,
             calmar_ratio=calmar_ratio,
+            daily_win_rate=daily_win_rate,
+            signal_changes=signal_changes,
+            entries=entries,
+            exits=exits,
+            round_trips=round_trips,
+            valid_metrics=valid_metrics,
+            ruin_event=ruin_event,
         )
 
 

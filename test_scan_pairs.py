@@ -18,6 +18,7 @@ from scan_pairs import (
     format_results_table,
     print_scan_results,
     TOP_20_SYMBOLS,
+    _sort_results,
 )
 
 
@@ -87,6 +88,17 @@ class TestGeneratePairs(unittest.TestCase):
         for pair in pairs:
             reversed_pair = (pair[1], pair[0])
             self.assertNotIn(reversed_pair, pairs)
+
+    def test_generate_pairs_bidirectional(self):
+        """Bidirectional mode should include A/B and B/A."""
+        scanner = PairScanner()
+        symbols = ["BTC", "ETH", "SOL"]
+
+        pairs = scanner.generate_pairs(symbols, bidirectional=True)
+
+        self.assertIn(("BTC", "ETH"), pairs)
+        self.assertIn(("ETH", "BTC"), pairs)
+        self.assertEqual(len(pairs), 6)
 
 
 class TestRunSinglePair(unittest.TestCase):
@@ -379,6 +391,30 @@ class TestFormatResultsTable(unittest.TestCase):
 
         # Check separator line
         self.assertTrue(lines[1].startswith("-"))
+
+    def test_sort_results_puts_invalid_metrics_last(self):
+        """Invalid metric rows should not rank above valid rows."""
+        df = pd.DataFrame({
+            "pair": ["BAD/PAIR", "GOOD/PAIR"],
+            "sharpe_ratio": [999.0, 1.0],
+            "valid_metrics": [False, True],
+        })
+
+        sorted_df = _sort_results(df, "sharpe_ratio")
+
+        self.assertEqual(sorted_df.iloc[0]["pair"], "GOOD/PAIR")
+
+    def test_sort_results_prefers_smaller_drawdown_magnitude(self):
+        """Less negative max drawdown should rank ahead of deeper drawdowns."""
+        df = pd.DataFrame({
+            "pair": ["DEEP/DD", "SHALLOW/DD"],
+            "max_drawdown": [-0.25, -0.05],
+            "valid_metrics": [True, True],
+        })
+
+        sorted_df = _sort_results(df, "max_drawdown")
+
+        self.assertEqual(sorted_df.iloc[0]["pair"], "SHALLOW/DD")
 
 
 class TestPrintScanResults(unittest.TestCase):
