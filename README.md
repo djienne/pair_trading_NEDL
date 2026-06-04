@@ -124,8 +124,10 @@ Numbers come from `output/pair_scan_results.csv` (net of the configured
 `config.json` is grouped into top-level data settings plus `strategy`,
 `backtest`, and `scan` sections. Key fields:
 
-- **Data** — `interval` (only `1d` is fully supported), `start_date` / `end_date`,
-  `feather_dir`, `output_dir`, `binance_base_url`, `exclude_incomplete_candles`.
+- **Data** — `symbols` (default pair for `backtest.py`, download list for
+  `download_data.py`), `quote`, `interval` (only `1d` is fully supported),
+  `start_date` / `end_date`, `feather_dir`, `output_dir`, `binance_base_url`,
+  `exclude_incomplete_candles`.
 - **Symbol selection** — `auto_fetch_symbols`, `top_n_symbols`,
   `symbol_cache_hours`; set `scan_symbols` to pin a fixed universe instead.
 - **Download cache** — `download_grace_hours`, `download_cache_file`.
