@@ -1,0 +1,29 @@
+{
+    "symbols": ["BTC", "ETH"],
+    "quote": "USDT",
+    "auto_fetch_symbols": true,
+    "top_n_symbols": 50,
+    "symbol_cache_hours": 24,
+    "interval": "1d",
+    "start_date": "2019-01-01",
+    "end_date": null,
+    "binance_base_url": "https://fapi.binance.com",
+    "max_klines_per_request": 1500,
+    "feather_dir": "data/feather",
+    "output_dir": "output",
+
+    "strategy": {
+        "window": 21,
+        "kpss_threshold": 0.463,
+        "entry_threshold": 0.02,
+        "stop_loss_threshold": -0.05,
+        "transaction_fee": 0.0001,
+        "unbiased_formulation": true,
+        "beta_loading": false,
+        "beta_proxy_symbol": "BTC"
+    },
+
+    "backtest": {
+        "initial_capital": 1000
+    }
+}
