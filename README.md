@@ -165,3 +165,11 @@ Numbers come from `output/pair_scan_results.csv` (net of the configured
 - Generated files in `output/` and cached data in `data/` are local research
   artifacts. Keep or ignore them depending on whether reproducible cached data is
   part of the experiment you want to version.
+
+## References
+
+This implementation is based on the NEDL YouTube channel's cointegration pair
+trading series:
+
+- [Part 1](https://youtu.be/x_xoq6eY85s?si=3X0U4uaYFF3qFgVg)
+- [Part 2](https://youtu.be/jvZ0vuC9oJk?si=UhpDBKR-eeLVrJP_)
